@@ -158,6 +158,27 @@ fn create_plain_mint(svm: &mut LiteSVM, payer: &Keypair) -> Keypair {
     mint
 }
 
+fn create_seizable_mint(svm: &mut LiteSVM, payer: &Keypair) -> Keypair {
+    let mint = Keypair::new();
+    send(
+        svm,
+        payer,
+        &[Instruction {
+            program_id: ID,
+            accounts: accounts::CreateSeizableMint {
+                payer: payer.pubkey(),
+                mint: mint.pubkey(),
+                token_program: TOKEN_2022_PROGRAM_ID,
+                system_program: system_program::ID,
+            }
+            .to_account_metas(None),
+            data: instruction::CreateSeizableMint { decimals: DECIMALS }.data(),
+        }],
+        &[&mint],
+    );
+    mint
+}
+
 fn delegate_via_cpi_ix(token_account: &Pubkey, delegate: &Pubkey, owner: &Pubkey) -> Instruction {
     Instruction {
         program_id: ID,
@@ -305,23 +326,7 @@ fn a_permanent_delegate_moves_tokens_without_consent() {
     let (mut svm, payer) = setup();
 
     // The mint's permanent delegate is the payer, set declaratively.
-    let mint = Keypair::new();
-    send(
-        &mut svm,
-        &payer,
-        &[Instruction {
-            program_id: ID,
-            accounts: accounts::CreateSeizableMint {
-                payer: payer.pubkey(),
-                mint: mint.pubkey(),
-                token_program: TOKEN_2022_PROGRAM_ID,
-                system_program: system_program::ID,
-            }
-            .to_account_metas(None),
-            data: instruction::CreateSeizableMint { decimals: DECIMALS }.data(),
-        }],
-        &[&mint],
-    );
+    let mint = create_seizable_mint(&mut svm, &payer);
 
     // A holder who has nothing to do with the mint authority.
     let victim = Keypair::new();
@@ -376,4 +381,55 @@ fn a_permanent_delegate_moves_tokens_without_consent() {
     assert_eq!(after, 0);
     assert_eq!(taken, 1_000);
     println!("permanent delegate moved 1000 with no approval and no holder signature");
+}
+
+#[test]
+fn wrong_delegate_cannot_seize() {
+    let (mut svm, payer) = setup();
+    let mint = create_seizable_mint(&mut svm, &payer);
+    let holder = Keypair::new();
+    let wrong_delegate = Keypair::new();
+    let source = plain_account(&mut svm, &payer, &mint.pubkey(), &holder.pubkey());
+    let destination = plain_account(&mut svm, &payer, &mint.pubkey(), &payer.pubkey());
+    send(
+        &mut svm,
+        &payer,
+        &[mint_to(
+            &TOKEN_2022_PROGRAM_ID,
+            &mint.pubkey(),
+            &source,
+            &payer.pubkey(),
+            &[],
+            1_000,
+        )
+        .unwrap()],
+        &[],
+    );
+
+    let before_source = svm.get_account(&source).unwrap().data;
+    let before_destination = svm.get_account(&destination).unwrap().data;
+    let logs = send_expecting_failure(
+        &mut svm,
+        &payer,
+        &[Instruction {
+            program_id: ID,
+            accounts: accounts::PermanentDelegateSeize {
+                source,
+                mint: mint.pubkey(),
+                destination,
+                permanent_delegate: wrong_delegate.pubkey(),
+                token_program: TOKEN_2022_PROGRAM_ID,
+            }
+            .to_account_metas(None),
+            data: instruction::PermanentDelegateSeize {
+                amount: 500,
+                decimals: DECIMALS,
+            }
+            .data(),
+        }],
+        &[&wrong_delegate],
+    );
+    assert!(logs.contains("owner does not match") || logs.contains("OwnerMismatch"), "unexpected failure:\n{logs}");
+    assert_eq!(svm.get_account(&source).unwrap().data, before_source);
+    assert_eq!(svm.get_account(&destination).unwrap().data, before_destination);
 }

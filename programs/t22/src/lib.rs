@@ -9,11 +9,14 @@ use spl_token_2022::{
     extension::{
         confidential_transfer::{instruction as confidential_instruction, DecryptableBalance},
         confidential_transfer_fee::instruction as confidential_fee_instruction,
-        transfer_fee::TransferFeeConfig, BaseStateWithExtensions, ExtensionType,
+        transfer_fee::{instruction as fee_instruction, TransferFeeConfig}, BaseStateWithExtensions, ExtensionType,
         StateWithExtensions,
     },
     state::Mint as MintState,
 };
+
+pub mod remittance;
+pub use remittance::*;
 
 // The length of a ciphertext which is how a decryptable balance is represented in the account data
 pub const AE_CIPHERTEXT_LEN: usize = 36;
@@ -25,11 +28,49 @@ const SUPPORTED_EXTENSIONS: &[ExtensionType] = &[
     ExtensionType::MintCloseAuthority,
     ExtensionType::MetadataPointer,
     ExtensionType::TransferFeeConfig,
+    ExtensionType::DefaultAccountState,
+    ExtensionType::TokenMetadata,
+    ExtensionType::PermanentDelegate,
+    ExtensionType::ConfidentialTransferMint,
+    ExtensionType::ConfidentialTransferFeeConfig,
 ];
 
 #[program]
 pub mod t22 {
     use super::*;
+
+    pub fn create_base_mint(
+        ctx: Context<CreateRemittanceMint>,
+        args: RemittanceMintArgs,
+    ) -> Result<()> {
+        remittance::create_mint(ctx, args, None)
+    }
+
+    pub fn create_reissued_mint(
+        ctx: Context<CreateRemittanceMint>,
+        args: RemittanceMintArgs,
+        confidential_authority: Pubkey,
+        permanent_delegate: Pubkey,
+        confidential_fee_withdrawal_elgamal_pubkey: [u8; 32],
+    ) -> Result<()> {
+        remittance::create_mint(
+            ctx,
+            args,
+            Some(RemittanceConfidentialArgs {
+                confidential_authority,
+                permanent_delegate,
+                confidential_fee_withdrawal_elgamal_pubkey,
+            }),
+        )
+    }
+
+    pub fn thaw_remittance_account(ctx: Context<ThawRemittanceAccount>) -> Result<()> {
+        remittance::thaw_account(ctx)
+    }
+
+    pub fn transfer_with_fee(ctx: Context<TransferWithFee>, amount: u64) -> Result<()> {
+        remittance::transfer_fee_checked(ctx, amount)
+    }
 
     ///the declarative path.
     /// Everything happens in the `#[account(init, ...)]` attribute on the
@@ -437,19 +478,51 @@ pub mod t22 {
         amount: u64,
         decimals: u8,
     ) -> Result<()> {
-        transfer_checked(
-            CpiContext::new(
-                ctx.accounts.token_program.key(),
-                TransferChecked {
-                    from: ctx.accounts.source.to_account_info(),
-                    mint: ctx.accounts.mint.to_account_info(),
-                    to: ctx.accounts.destination.to_account_info(),
-                    authority: ctx.accounts.permanent_delegate.to_account_info(),
-                },
-            ),
-            amount,
-            decimals,
-        )?;
+        let fee = {
+            let mint_info = ctx.accounts.mint.to_account_info();
+            let data = mint_info.try_borrow_data()?;
+            let mint = StateWithExtensions::<MintState>::unpack(&data)?;
+            require_eq!(mint.base.decimals, decimals, MintError::WrongDecimals);
+            mint.get_extension::<TransferFeeConfig>()
+                .ok()
+                .map(|config| config.calculate_epoch_fee(Clock::get()?.epoch, amount)
+                    .ok_or_else(|| error!(MintError::FeeCalculationFailed)))
+                .transpose()?
+        };
+        if let Some(fee) = fee {
+            let ix = fee_instruction::transfer_checked_with_fee(
+                &ctx.accounts.token_program.key(),
+                &ctx.accounts.source.key(),
+                &ctx.accounts.mint.key(),
+                &ctx.accounts.destination.key(),
+                &ctx.accounts.permanent_delegate.key(),
+                &[],
+                amount,
+                decimals,
+                fee,
+            )?;
+            invoke(&ix, &[
+                ctx.accounts.source.to_account_info(),
+                ctx.accounts.mint.to_account_info(),
+                ctx.accounts.destination.to_account_info(),
+                ctx.accounts.permanent_delegate.to_account_info(),
+                ctx.accounts.token_program.to_account_info(),
+            ])?;
+        } else {
+            transfer_checked(
+                CpiContext::new(
+                    ctx.accounts.token_program.key(),
+                    TransferChecked {
+                        from: ctx.accounts.source.to_account_info(),
+                        mint: ctx.accounts.mint.to_account_info(),
+                        to: ctx.accounts.destination.to_account_info(),
+                        authority: ctx.accounts.permanent_delegate.to_account_info(),
+                    },
+                ),
+                amount,
+                decimals,
+            )?;
+        }
         msg!("seized {} without holder consent", amount);
         Ok(())
     }
@@ -677,4 +750,12 @@ pub struct PermanentDelegateSeize<'info> {
 pub enum MintError {
     #[msg("mint carries an extension this program has not been written to handle")]
     UnsupportedExtension,
+    WrongDecimals,
+    FeeCalculationFailed,
+    InvalidMetadataSize,
+    WrongMint,
+    WrongOwner,
+    AccountNotFrozen,
+    MissingTransferFee,
+    ZeroTransfer,
 }

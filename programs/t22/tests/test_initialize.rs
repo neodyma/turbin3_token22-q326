@@ -6,12 +6,12 @@ use anchor_lang::{
 };
 use anchor_spl::token_interface::spl_token_2022::{
     extension::{
-        default_account_state::instruction::initialize_default_account_state,
+        group_pointer::instruction::initialize as initialize_group_pointer,
         mint_close_authority::MintCloseAuthority, transfer_fee::TransferFeeConfig,
         BaseStateWithExtensions, ExtensionType, StateWithExtensions,
     },
     instruction::initialize_mint2,
-    state::{AccountState, Mint as MintState},
+    state::Mint as MintState,
 };
 use litesvm::LiteSVM;
 use solana_account::Account;
@@ -48,7 +48,6 @@ fn setup() -> (LiteSVM, Keypair) {
  
     (svm, payer)
 }
- 
 /// Send a transaction and require it to succeed.
 fn send(svm: &mut LiteSVM, payer: &Keypair, ix: Instruction, extra_signers: &[&Keypair]) {
     let mut signers: Vec<&Keypair> = vec![payer];
@@ -270,9 +269,9 @@ fn validation_rejects_a_mint_carrying_an_unlisted_extension() {
  
     // Built with the raw Token-2022 instructions rather than through the
     // program, because the point is a mint this program did not create.
-    // DefaultAccountState is not on the allowlist.
+    // GroupPointer is not on the allowlist.
     let space = ExtensionType::try_calculate_account_len::<MintState>(&[
-        ExtensionType::DefaultAccountState,
+        ExtensionType::GroupPointer,
     ])
     .unwrap();
     let lamports = svm.minimum_balance_for_rent_exemption(space);
@@ -287,10 +286,11 @@ fn validation_rejects_a_mint_carrying_an_unlisted_extension() {
         ),
         // Extension first, mint last. The ordering rule is the same whether
         // the caller is a program or a client.
-        initialize_default_account_state(
+        initialize_group_pointer(
             &TOKEN_2022_PROGRAM_ID,
             &mint.pubkey(),
-            &AccountState::Frozen,
+            Some(payer.pubkey()),
+            Some(mint.pubkey()),
         )
         .unwrap(),
         initialize_mint2(
@@ -362,4 +362,3 @@ fn validation_rejects_a_forged_mint_owned_by_another_program() {
         "forged mint was accepted, so the owner check is missing:\n{logs}"
     );
 }
- 

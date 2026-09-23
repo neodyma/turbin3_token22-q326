@@ -6,6 +6,7 @@ use anchor_lang::{
     InstructionData, ToAccountMetas,
 };
 use litesvm::LiteSVM;
+use litesvm::types::TransactionResult;
 use proofext::instruction::ProofLocation;
 use proofgen::{transfer::transfer_split_proof_data, transfer_with_fee::transfer_with_fee_split_proof_data ,withdraw::withdraw_proof_data};
 use solana_keypair::Keypair;
@@ -14,16 +15,21 @@ use solana_signer::Signer;
 use solana_transaction::Transaction;
 use solana_compute_budget_interface::ComputeBudgetInstruction;
 use std::num::NonZeroI8;
-use t22::{accounts, instruction, ID};
+use t22::{accounts, instruction, RemittanceMintArgs, ID};
 use t22new::{
     extension::{
-        confidential_transfer::{instruction as ct_ix, ConfidentialTransferAccount},
+        confidential_transfer::{instruction as ct_ix, ConfidentialTransferAccount, ConfidentialTransferMint},
         confidential_transfer_fee::{instruction::{disable_harvest_to_mint, enable_harvest_to_mint},ConfidentialTransferFeeAmount, ConfidentialTransferFeeConfig},
+        default_account_state::DefaultAccountState,
+        metadata_pointer::MetadataPointer,
+        permanent_delegate::PermanentDelegate,
+        transfer_fee::TransferFeeAmount,
         BaseStateWithExtensions, ExtensionType, StateWithExtensions,
     },
     instruction::{initialize_account3, mint_to},
-    state::{Account as TokenAccountState, Mint as MintState}
+    state::{Account as TokenAccountState, AccountState, Mint as MintState}
 };
+use token_metadata_new::state::TokenMetadata;
 use zk::{
     encryption::{
         auth_encryption::{AeCiphertext, AeKey},
@@ -55,14 +61,19 @@ fn setup() -> (LiteSVM, Keypair) {
 }
 
 fn send(svm: &mut LiteSVM, payer: &Keypair, ixs: &[Instruction], extra: &[&Keypair]) {
+    if let Err(e) = send_result(svm, payer, ixs, extra) {
+        panic!("tx failed: {:#?}", e.meta.logs);
+    }
+}
+
+fn send_result(svm: &mut LiteSVM, payer: &Keypair, ixs: &[Instruction], extra: &[&Keypair]) -> TransactionResult {
+    svm.expire_blockhash();
     let mut signers: Vec<&Keypair> = vec![payer];
     signers.extend_from_slice(extra);
     let bh = svm.latest_blockhash();
     let mut tx = Transaction::new_unsigned(Message::new(ixs, Some(&payer.pubkey())));
     tx.try_sign(&signers, bh).unwrap();
-    if let Err(e) = svm.send_transaction(tx) {
-        panic!("tx failed: {:#?}", e.meta.logs);
-    }
+    svm.send_transaction(tx)
 }
 
 #[test]
@@ -270,6 +281,75 @@ fn apply_pending(svm: &mut LiteSVM, payer: &Keypair, holder: &Holder, owner: &Ke
         .data(),
     };
     send(svm, payer, &[ix], &[owner]);
+}
+
+#[test]
+fn apply_requires_owner() {
+    let (mut svm, payer) = setup();
+    let mint = Keypair::new();
+    send(&mut svm, &payer, &[Instruction {
+        program_id: ID,
+        accounts: accounts::CreateConfidentialMint {
+            payer: payer.pubkey(),
+            mint: mint.pubkey(),
+            token_program: TOKEN_2022_PROGRAM_ID,
+            system_program: system_program::ID,
+        }.to_account_metas(None),
+        data: instruction::CreateConfidentialMint {
+            decimals: DECIMALS,
+            auto_approve_new_accounts: true,
+        }.data(),
+    }], &[&mint]);
+
+    let holder = create_and_configure(&mut svm, &payer, &mint.pubkey(), &payer);
+    send(&mut svm, &payer, &[mint_to(
+        &TOKEN_2022_PROGRAM_ID,
+        &mint.pubkey(),
+        &holder.account,
+        &payer.pubkey(),
+        &[],
+        1_000,
+    ).unwrap()], &[]);
+    send(&mut svm, &payer, &[Instruction {
+        program_id: ID,
+        accounts: accounts::DepositConfidential {
+            token_account: holder.account,
+            mint: mint.pubkey(),
+            authority: payer.pubkey(),
+            token_program: TOKEN_2022_PROGRAM_ID,
+        }.to_account_metas(None),
+        data: instruction::DepositConfidential {
+            amount: 1_000,
+            decimals: DECIMALS,
+        }.data(),
+    }], &[]);
+
+    let ct = read_ct(&svm, &holder.account);
+    assert_eq!(pending_balance(&ct, &holder.elgamal), 1_000);
+    assert_eq!(available_balance(&ct, &holder.elgamal), 0);
+    let counter: u64 = ct.pending_balance_credit_counter.into();
+    let wrong_owner = Keypair::new();
+    let before = svm.get_account(&holder.account).unwrap().data;
+    let result = send_result(&mut svm, &payer, &[Instruction {
+        program_id: ID,
+        accounts: accounts::ApplyPendingBalance {
+            token_account: holder.account,
+            authority: wrong_owner.pubkey(),
+            token_program: TOKEN_2022_PROGRAM_ID,
+        }.to_account_metas(None),
+        data: instruction::ApplyPendingBalance {
+            expected_pending_balance_credit_counter: counter,
+            new_decryptable_available_balance: holder.aes.encrypt(1_000).to_bytes(),
+        }.data(),
+    }], &[&wrong_owner]).expect_err("wrong owner applied pending balance");
+    let logs = result.meta.logs.join("\n");
+    assert!(logs.contains("owner does not match") || logs.contains("OwnerMismatch"), "unexpected failure:\n{logs}");
+    assert_eq!(svm.get_account(&holder.account).unwrap().data, before);
+
+    apply_pending(&mut svm, &payer, &holder, &payer);
+    let ct = read_ct(&svm, &holder.account);
+    assert_eq!(pending_balance(&ct, &holder.elgamal), 0);
+    assert_eq!(available_balance(&ct, &holder.elgamal), 1_000);
 }
 
 /// Verify a proof into its own context state account, so the token instruction
@@ -617,7 +697,6 @@ fn a_tampered_proof_is_rejected() {
         }
     }
 }
- 
 #[test]
 fn confidential_transfer_fee_mint_stacks_three_extensions() {
     let (mut svm, payer) = setup();
@@ -913,58 +992,208 @@ fn withheld_on_account(svm: &LiteSVM, account: &Pubkey, fee_authority: &ElGamalK
     let ciphertext: ElGamalCiphertext = ext.withheld_amount.try_into().unwrap();
     fee_authority.secret().decrypt_u32(&ciphertext).unwrap()
 }
+
+fn remittance_args(freeze: &Keypair, close: &Keypair, fee_config: &Keypair, withdraw: &Keypair) -> RemittanceMintArgs {
+    RemittanceMintArgs {
+        decimals: DECIMALS,
+        transfer_fee_basis_points: FEE_BASIS_POINTS,
+        maximum_fee: MAXIMUM_FEE,
+        freeze_authority: freeze.pubkey(),
+        close_authority: close.pubkey(),
+        fee_config_authority: fee_config.pubkey(),
+        withdraw_withheld_authority: withdraw.pubkey(),
+        name: "Remit USD".into(),
+        symbol: "RUSD".into(),
+        uri: "https://example.com/remit.json".into(),
+    }
+}
+
+fn thaw_remittance(svm: &mut LiteSVM, payer: &Keypair, mint: Pubkey, account: Pubkey, freeze: &Keypair) {
+    send(svm, payer, &[Instruction {
+        program_id: ID,
+        accounts: accounts::ThawRemittanceAccount {
+            token_account: account,
+            mint,
+            freeze_authority: freeze.pubkey(),
+            token_program: TOKEN_2022_PROGRAM_ID,
+        }.to_account_metas(None),
+        data: instruction::ThawRemittanceAccount {}.data(),
+    }], &[freeze]);
+}
  
 #[test]
-fn a_confidential_transfer_with_fee_withholds_an_encrypted_fee() {
+fn reissued_mint_lifecycle() {
     let (mut svm, payer) = setup();
-    let (mint, fee_authority) = create_fee_mint(&mut svm, &payer);
+    let base = Keypair::new();
+    let mint = Keypair::new();
+    let freeze = Keypair::new();
+    let close = Keypair::new();
+    let fee_config = Keypair::new();
+    let withdraw = Keypair::new();
+    let confidential_authority = Keypair::new();
+    let delegate = Keypair::new();
+    let (fee_authority, _) = derive_confidential_keys(&withdraw, b"").unwrap();
+    let args = remittance_args(&freeze, &close, &fee_config, &withdraw);
+    send(&mut svm, &payer, &[Instruction {
+        program_id: ID,
+        accounts: accounts::CreateRemittanceMint {
+            payer: payer.pubkey(),
+            mint: base.pubkey(),
+            token_program: TOKEN_2022_PROGRAM_ID,
+            system_program: system_program::ID,
+        }.to_account_metas(None),
+        data: instruction::CreateBaseMint { args: args.clone() }.data(),
+    }], &[&base]);
+    let base_data = svm.get_account(&base.pubkey()).unwrap();
+    let base_state = StateWithExtensions::<MintState>::unpack(&base_data.data).unwrap();
+    assert_eq!(base_state.get_extension_types().unwrap().len(), 5);
+    assert!(base_state.get_extension::<ConfidentialTransferMint>().is_err());
+
+    send(&mut svm, &payer, &[Instruction {
+        program_id: ID,
+        accounts: accounts::CreateRemittanceMint {
+            payer: payer.pubkey(),
+            mint: mint.pubkey(),
+            token_program: TOKEN_2022_PROGRAM_ID,
+            system_program: system_program::ID,
+        }.to_account_metas(None),
+        data: instruction::CreateReissuedMint {
+            args,
+            confidential_authority: confidential_authority.pubkey(),
+            permanent_delegate: delegate.pubkey(),
+            confidential_fee_withdrawal_elgamal_pubkey: fee_authority.pubkey().to_bytes(),
+        }.data(),
+    }], &[&mint]);
+    let mint_data = svm.get_account(&mint.pubkey()).unwrap();
+    let mint_state = StateWithExtensions::<MintState>::unpack(&mint_data.data).unwrap();
+    assert_eq!(mint_state.get_extension_types().unwrap(), vec![
+        ExtensionType::MintCloseAuthority,
+        ExtensionType::TransferFeeConfig,
+        ExtensionType::MetadataPointer,
+        ExtensionType::DefaultAccountState,
+        ExtensionType::PermanentDelegate,
+        ExtensionType::ConfidentialTransferMint,
+        ExtensionType::ConfidentialTransferFeeConfig,
+        ExtensionType::TokenMetadata,
+    ]);
+    assert_eq!(Option::<Pubkey>::from(mint_state.get_extension::<MetadataPointer>().unwrap().metadata_address), Some(mint.pubkey()));
+    assert_eq!(mint_state.get_variable_len_extension::<TokenMetadata>().unwrap().name, "Remit USD");
+    assert_eq!(mint_state.get_extension::<DefaultAccountState>().unwrap().state, AccountState::Frozen as u8);
+    assert_eq!(Option::<Pubkey>::from(mint_state.get_extension::<PermanentDelegate>().unwrap().delegate), Some(delegate.pubkey()));
+    assert_eq!(bool::from(mint_state.get_extension::<ConfidentialTransferMint>().unwrap().auto_approve_new_accounts), false);
+    assert_eq!(Option::<Pubkey>::from(mint_state.get_extension::<ConfidentialTransferMint>().unwrap().authority), Some(confidential_authority.pubkey()));
+    assert_eq!(mint_state.get_extension::<ConfidentialTransferFeeConfig>().unwrap().withdraw_withheld_authority_elgamal_pubkey.0, fee_authority.pubkey().to_bytes());
+    drop(mint_data);
  
     let alice_owner = payer.insecure_clone();
     let bob_owner = Keypair::new();
     svm.airdrop(&bob_owner.pubkey(), 10_000_000_000).unwrap();
+    let unconfigured = Keypair::new();
+    let account_len = ExtensionType::try_calculate_account_len::<TokenAccountState>(&[
+        ExtensionType::TransferFeeAmount,
+        ExtensionType::ConfidentialTransferAccount,
+        ExtensionType::ConfidentialTransferFeeAmount,
+    ]).unwrap();
+    let account_rent = svm.minimum_balance_for_rent_exemption(account_len);
+    send(&mut svm, &payer, &[
+        solana_system_interface::instruction::create_account(
+            &payer.pubkey(), &unconfigured.pubkey(),
+            account_rent, account_len as u64,
+            &TOKEN_2022_PROGRAM_ID,
+        ),
+        initialize_account3(&TOKEN_2022_PROGRAM_ID, &unconfigured.pubkey(), &mint.pubkey(), &bob_owner.pubkey()).unwrap(),
+    ], &[&unconfigured]);
+    let before_configure = svm.get_account(&unconfigured.pubkey()).unwrap().data;
+    let (wrong_elgamal, wrong_aes) = derive_confidential_keys(&payer, b"").unwrap();
+    let wrong_proof = build_pubkey_validity_proof_data(&wrong_elgamal).unwrap();
+    let wrong_configure = ct_ix::configure_account(
+        &TOKEN_2022_PROGRAM_ID,
+        &unconfigured.pubkey(),
+        &mint.pubkey(),
+        &wrong_aes.encrypt(0).into(),
+        65536,
+        &payer.pubkey(),
+        &[],
+        ProofLocation::InstructionOffset(NonZeroI8::new(1).unwrap(), &wrong_proof),
+    ).unwrap();
+    let error = send_result(&mut svm, &payer, &wrong_configure, &[]).expect_err("non-owner configured confidential account");
+    let logs = error.meta.logs.join("\n");
+    assert!(logs.contains("owner does not match") || logs.contains("OwnerMismatch"), "unexpected failure:\n{logs}");
+    assert_eq!(svm.get_account(&unconfigured.pubkey()).unwrap().data, before_configure);
  
     let alice = configure_fee_holder(&mut svm, &payer, &mint.pubkey(), &alice_owner);
     let bob = configure_fee_holder(&mut svm, &payer, &mint.pubkey(), &bob_owner);
- 
-    // Fund alice and move it into her confidential available balance.
-    send(
-        &mut svm,
-        &payer,
-        &[mint_to(
+    assert_eq!(svm.get_account(&alice.account).unwrap().data.len(), account_len);
+    assert_eq!(svm.get_account(&bob.account).unwrap().data.len(), account_len);
+    assert_eq!(bool::from(read_ct(&svm, &alice.account).approved), false);
+    assert_eq!(bool::from(read_ct(&svm, &bob.account).approved), false);
+    let mint_ix = mint_to(&TOKEN_2022_PROGRAM_ID, &mint.pubkey(), &alice.account, &payer.pubkey(), &[], 100_500).unwrap();
+    assert!(send_result(&mut svm, &payer, &[mint_ix.clone()], &[]).is_err());
+    thaw_remittance(&mut svm, &payer, mint.pubkey(), alice.account, &freeze);
+    thaw_remittance(&mut svm, &payer, mint.pubkey(), bob.account, &freeze);
+    send(&mut svm, &payer, &[mint_ix], &[]);
+    let deposit_ix = Instruction {
+        program_id: ID,
+        accounts: accounts::DepositConfidential {
+            token_account: alice.account,
+            mint: mint.pubkey(),
+            authority: payer.pubkey(),
+            token_program: TOKEN_2022_PROGRAM_ID,
+        }.to_account_metas(None),
+        data: instruction::DepositConfidential { amount: 100_000, decimals: DECIMALS }.data(),
+    };
+    assert!(send_result(&mut svm, &payer, &[deposit_ix.clone()], &[]).is_err());
+    let alice_before = StateWithExtensions::<TokenAccountState>::unpack(&svm.get_account(&alice.account).unwrap().data).unwrap().base.amount;
+    assert_eq!(alice_before, 100_500);
+    let wrong_approval = ct_ix::approve_account(
+        &TOKEN_2022_PROGRAM_ID, &alice.account, &mint.pubkey(), &payer.pubkey(), &[],
+    ).unwrap();
+    let error = send_result(&mut svm, &payer, &[wrong_approval], &[]).expect_err("wrong authority approved confidential account");
+    let logs = error.meta.logs.join("\n");
+    assert!(logs.contains("MissingRequiredSignature"), "unexpected failure:\n{logs}");
+    assert_eq!(bool::from(read_ct(&svm, &alice.account).approved), false);
+    for account in [alice.account, bob.account] {
+        send(&mut svm, &payer, &[ct_ix::approve_account(
             &TOKEN_2022_PROGRAM_ID,
+            &account,
             &mint.pubkey(),
-            &alice.account,
-            &payer.pubkey(),
+            &confidential_authority.pubkey(),
             &[],
-            100_000,
-        )
-        .unwrap()],
-        &[],
-    );
-    send(
-        &mut svm,
-        &payer,
-        &[Instruction {
-            program_id: ID,
-            accounts: accounts::DepositConfidential {
-                token_account: alice.account,
-                mint: mint.pubkey(),
-                authority: payer.pubkey(),
-                token_program: TOKEN_2022_PROGRAM_ID,
-            }
-            .to_account_metas(None),
-            data: instruction::DepositConfidential {
-                amount: 100_000,
-                decimals: DECIMALS,
-            }
-            .data(),
-        }],
-        &[],
-    );
+        ).unwrap()], &[&confidential_authority]);
+        assert_eq!(bool::from(read_ct(&svm, &account).approved), true);
+    }
+    let seize_ix = Instruction {
+        program_id: ID,
+        accounts: accounts::PermanentDelegateSeize {
+            source: alice.account,
+            mint: mint.pubkey(),
+            destination: bob.account,
+            permanent_delegate: delegate.pubkey(),
+            token_program: TOKEN_2022_PROGRAM_ID,
+        }.to_account_metas(None),
+        data: instruction::PermanentDelegateSeize { amount: 500, decimals: DECIMALS }.data(),
+    };
+    send(&mut svm, &payer, &[seize_ix.clone()], &[&delegate]);
+    let alice_public = StateWithExtensions::<TokenAccountState>::unpack(&svm.get_account(&alice.account).unwrap().data).unwrap().base.amount;
+    let bob_public = StateWithExtensions::<TokenAccountState>::unpack(&svm.get_account(&bob.account).unwrap().data).unwrap().base.amount;
+    assert_eq!((alice_public, bob_public), (100_000, 487));
+    let bob_data = svm.get_account(&bob.account).unwrap();
+    let bob_state = StateWithExtensions::<TokenAccountState>::unpack(&bob_data.data).unwrap();
+    assert_eq!(u64::from(bob_state.get_extension::<TransferFeeAmount>().unwrap().withheld_amount), 13);
+    send(&mut svm, &payer, &[deposit_ix], &[]);
+    let alice_public = StateWithExtensions::<TokenAccountState>::unpack(&svm.get_account(&alice.account).unwrap().data).unwrap().base.amount;
+    assert_eq!(alice_public, 0);
+    assert_eq!(pending_balance(&read_ct(&svm, &alice.account), &alice.elgamal), 100_000);
     apply_pending(&mut svm, &payer, &alice, &alice_owner);
  
     let alice_available = available_balance(&read_ct(&svm, &alice.account), &alice.elgamal);
     assert_eq!(alice_available, 100_000);
+    let seize_hidden = Instruction {
+        data: instruction::PermanentDelegateSeize { amount: 1, decimals: DECIMALS }.data(),
+        ..seize_ix
+    };
+    assert!(send_result(&mut svm, &payer, &[seize_hidden], &[&delegate]).is_err());
+    assert_eq!(available_balance(&read_ct(&svm, &alice.account), &alice.elgamal), 100_000);
     assert_eq!(withheld_on_account(&svm, &bob.account, &fee_authority), 0);
  
     // ---- the fee bearing transfer ----------------------------------------
@@ -1095,5 +1324,41 @@ fn a_confidential_transfer_with_fee_withholds_an_encrypted_fee() {
         .try_into()
         .unwrap();
     assert_ne!(bob.elgamal.secret().decrypt_u32(&raw), Some(expected_fee));
+    let bob_before_apply = read_ct(&svm, &bob.account);
+    let bob_ciphertext: ElGamalCiphertext = bob_before_apply.available_balance.try_into().unwrap();
+    assert_eq!(available_balance(&bob_before_apply, &bob.elgamal), 0);
+    assert!(withdraw_proof_data(&bob_ciphertext, 0, 1_000, &bob.elgamal).is_err());
+    apply_pending(&mut svm, &payer, &bob, &bob_owner);
+    let bob_after_apply = read_ct(&svm, &bob.account);
+    assert_eq!(pending_balance(&bob_after_apply, &bob.elgamal), 0);
+    assert_eq!(available_balance(&bob_after_apply, &bob.elgamal), 9_750);
+
+    let bob_ciphertext: ElGamalCiphertext = bob_after_apply.available_balance.try_into().unwrap();
+    let withdraw_proofs = withdraw_proof_data(&bob_ciphertext, 9_750, 1_000, &bob.elgamal).unwrap();
+    let equality_context = stage_proof(
+        &mut svm, &payer, ProofInstruction::VerifyCiphertextCommitmentEquality,
+        &withdraw_proofs.equality_proof_data,
+    );
+    let range_context = stage_proof(
+        &mut svm, &payer, ProofInstruction::VerifyBatchedRangeProofU64,
+        &withdraw_proofs.range_proof_data,
+    );
+    let withdraw_ix = ct_ix::withdraw(
+        &TOKEN_2022_PROGRAM_ID,
+        &bob.account,
+        &mint.pubkey(),
+        1_000,
+        DECIMALS,
+        &bob.aes.encrypt(8_750).into(),
+        &bob_owner.pubkey(),
+        &[],
+        ProofLocation::ContextStateAccount(&equality_context),
+        ProofLocation::ContextStateAccount(&range_context),
+    ).unwrap();
+    send(&mut svm, &payer, &withdraw_ix, &[&bob_owner]);
+    close_contexts(&mut svm, &payer, &[equality_context, range_context]);
+    let bob_data = svm.get_account(&bob.account).unwrap();
+    let bob_state = StateWithExtensions::<TokenAccountState>::unpack(&bob_data.data).unwrap();
+    assert_eq!(bob_state.base.amount, 1_487);
+    assert_eq!(available_balance(&read_ct(&svm, &bob.account), &bob.elgamal), 8_750);
 }
- 
